@@ -1,16 +1,76 @@
 import { supabase } from './supabaseClient'
 
+// ── COMPRESSION D'IMAGES ─────────────────────────────────────
+// Redimensionne et compresse une image avant upload pour accélérer
+// le chargement du site (photos de téléphone = souvent 4-8 Mo,
+// inutile pour l'affichage web).
+export async function compressImage(file, maxWidth = 1280, quality = 0.75) {
+  // On ne touche pas aux fichiers déjà petits (ex: déjà compressés)
+  if (file.size < 300 * 1024) return file
+
+  return new Promise((resolve) => {
+    const img = new Image()
+    const reader = new FileReader()
+
+    reader.onload = (e) => {
+      img.onload = () => {
+        let { width, height } = img
+        if (width > maxWidth) {
+          height = Math.round((height * maxWidth) / width)
+          width = maxWidth
+        }
+
+        const canvas = document.createElement('canvas')
+        canvas.width = width
+        canvas.height = height
+        const ctx = canvas.getContext('2d')
+        ctx.drawImage(img, 0, 0, width, height)
+
+        canvas.toBlob(
+          (blob) => {
+            if (!blob) { resolve(file); return }
+            const compressedFile = new File([blob], file.name, {
+              type: 'image/jpeg',
+              lastModified: Date.now(),
+            })
+            resolve(compressedFile)
+          },
+          'image/jpeg',
+          quality
+        )
+      }
+      img.onerror = () => resolve(file) // si échec, on garde l'original
+      img.src = e.target.result
+    }
+    reader.onerror = () => resolve(file)
+    reader.readAsDataURL(file)
+  })
+}
+
 // ── ANNONCES ──────────────────────────────────────────────────
-export async function fetchListings() {
-  const { data, error } = await supabase
+const PAGE_SIZE = 24 // nombre d'annonces chargées par page
+
+export async function fetchListings(page = 0) {
+  const from = page * PAGE_SIZE
+  const to = from + PAGE_SIZE - 1
+
+  const { data, error, count } = await supabase
     .from('listings')
-    .select('*, listing_photos(url, position)')
+    .select('*, listing_photos(url, position)', { count: 'exact' })
     .order('created_at', { ascending: false })
-  if (error) { console.error(error); return [] }
-  return data.map(l => ({
+    .range(from, to)
+
+  if (error) { console.error(error); return { listings: [], hasMore: false, total: 0 } }
+
+  const listings = data.map(l => ({
     ...l,
     photos: (l.listing_photos || []).sort((a,b)=>a.position-b.position).map(p=>p.url),
   }))
+
+  const total = count || 0
+  const hasMore = to + 1 < total
+
+  return { listings, hasMore, total }
 }
 
 export async function createListing(listing) {
@@ -58,10 +118,12 @@ export async function deleteListing(id) {
 
 // ── PHOTOS ────────────────────────────────────────────────────
 export async function uploadPhoto(file, listingId) {
-  const fileName = `${listingId}/${Date.now()}-${file.name}`
+  // Compression avant envoi : accélère l'upload et le chargement du site
+  const compressed = await compressImage(file, 1280, 0.75)
+  const fileName = `${listingId}/${Date.now()}-${file.name.replace(/\.[^.]+$/, '.jpg')}`
   const { error: uploadError } = await supabase.storage
     .from('listing-photos')
-    .upload(fileName, file)
+    .upload(fileName, compressed)
   if (uploadError) { console.error(uploadError); return null }
 
   const { data: urlData } = supabase.storage
